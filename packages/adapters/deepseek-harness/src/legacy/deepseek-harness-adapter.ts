@@ -1998,6 +1998,7 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
   readonly #options: DeepSeekHarnessAdapterOptions;
   readonly #sessions = new Set<DeepSeekHarnessSession>();
   readonly #toolOutputLimit: number;
+  readonly #lifetime = new AbortController();
   #closePromise: Promise<void> | null = null;
 
   constructor(
@@ -2016,14 +2017,24 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
   async #listSessionImportCandidates(): Promise<
     HarnessResult<readonly DeepSeekModernSessionCandidate[]>
   > {
-    if (this.#closePromise) {
+    const signal = this.#lifetime.signal;
+    if (this.#closePromise || signal.aborted) {
       return { ok: false, error: invalidState("DeepSeek Harness Adapter is closing") };
     }
     try {
-      await this.#connection.connect();
-      const listed = unwrapRpc(await this.#connection.client.sessions.list({}), "session.list");
+      await this.#connection.connect(signal);
+      const listed = unwrapRpc(
+        await this.#connection.client.sessions.list({}, signal),
+        "session.list",
+      );
+      if (this.#closePromise || signal.aborted) {
+        return { ok: false, error: invalidState("DeepSeek Harness Adapter is closing") };
+      }
       return { ok: true, value: parseLegacySessionCandidates(listed.items) };
     } catch (error) {
+      if (signal.aborted || this.#closePromise) {
+        return { ok: false, error: invalidState("DeepSeek Harness Adapter is closing") };
+      }
       return { ok: false, error: normalizedError(error, "unavailable") };
     }
   }
@@ -2415,6 +2426,7 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
   }
 
   close(): Promise<void> {
+    this.#lifetime.abort(new Error("DeepSeek Harness Adapter closed"));
     this.#closePromise ??= Promise.allSettled([
       ...[...this.#sessions].map((session) => session.close()),
     ]).then(async () => this.#connection.close());

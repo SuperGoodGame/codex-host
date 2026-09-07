@@ -596,8 +596,28 @@ describe("DeepSeekHarnessAdapter local Host", () => {
       ],
     });
     expect(connection.connected).toBe(true);
-    expect(connection.calls.list).toHaveBeenCalledWith({});
+    expect(connection.calls.list).toHaveBeenCalledWith({}, expect.any(AbortSignal));
     await adapter.close();
+  });
+
+  it("cancels Legacy Session discovery when the adapter closes", async () => {
+    const { adapter, connection } = fixture();
+    connection.calls.list.mockImplementationOnce(
+      (_payload: unknown, signal?: AbortSignal) =>
+        new Promise((_resolve, reject) => {
+          const abort = (): void => reject(new Error("aborted"));
+          if (signal?.aborted) abort();
+          else signal?.addEventListener("abort", abort, { once: true });
+        }),
+    );
+
+    const pending = adapter.sessionImport.listCandidates();
+    await adapter.close();
+    await expect(pending).resolves.toMatchObject({
+      ok: false,
+      error: { code: "invalidState" },
+    });
+    expect(connection.closed).toBe(true);
   });
 
   it("publishes stable live and historical Checkpoints for every native Turn outcome", async () => {

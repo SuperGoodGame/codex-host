@@ -147,6 +147,7 @@ describe("AppServerHost hermetic Claude projection", () => {
           },
         ];
       },
+      readGoalRecords: async () => [],
       readSubagentMessages: async () => [],
       createTransport: (input) => {
         nativeSessionId = input.sessionId;
@@ -171,6 +172,8 @@ describe("AppServerHost hermetic Claude projection", () => {
           compact: async () => ({ status: "succeeded" }),
           init: async () => ({ status: "succeeded" }),
           recap: async () => ({ status: "succeeded" }),
+          goal: async () => ({ status: "succeeded" }),
+          clearGoal: async () => ({ status: "succeeded" }),
           runTurn: async (_text, userMessageId, onEvent) => {
             nativeTurnKey = userMessageId;
             onEvent({

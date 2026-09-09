@@ -848,15 +848,20 @@ describe("ClaudeSdkTransport autonomous task continuation", () => {
 });
 
 describe("ClaudeSdkTransport process environment", () => {
-  it("adds the Host Node runtime to the Claude process PATH", async () => {
+  it("adds the Host Node runtime and keeps persisted Sessions visible to Claude CLI", async () => {
     const value = fixture("create", "default", harnessThinkingOptionIdSchema.parse("auto"), {
       PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+      CLAUDE_CODE_ENTRYPOINT: "sdk-ts",
     });
 
     await value.transport.start();
     expect(options(value).env?.PATH?.split(path.delimiter)).toContain(
       path.dirname(process.execPath),
     );
+    expect(options(value).env).toMatchObject({
+      CLAUDE_AGENT_SDK_CLIENT_APP: "codexhost-claude-code-adapter/0.0.0",
+      CLAUDE_CODE_ENTRYPOINT: "codexhost",
+    });
     await value.transport.close();
   });
 });
@@ -1030,6 +1035,7 @@ describe("ClaudeSdkTransport Model control", () => {
     expect(options(value).env?.PATH?.split(path.delimiter)).toContain(
       path.dirname(process.execPath),
     );
+    expect(options(value).env?.CLAUDE_CODE_ENTRYPOINT).toBe("codexhost");
     expect(options(value)).not.toHaveProperty("sessionId");
     expect(options(value)).not.toHaveProperty("resume");
   });

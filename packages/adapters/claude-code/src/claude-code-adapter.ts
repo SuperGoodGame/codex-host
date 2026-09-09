@@ -25,6 +25,9 @@ import {
   type HarnessSession,
   type HarnessSessionCapabilities,
   type HarnessSessionState,
+  type GoalClearCompleted,
+  type GoalReadCompleted,
+  type HarnessGoalCapability,
   type HostAgentMessageItem,
   type HostApprovalInteraction,
   type HostCommand,
@@ -75,7 +78,14 @@ import { ClaudePendingSessions, isPendingClaudeSession } from "./pending-session
 import { forkClaudeSession } from "./claude-fork.js";
 import { mapClaudeSnapshot, mapClaudeSubagentSnapshot } from "./claude-history.js";
 import { claudeTranscriptItemId } from "./item-identity.js";
-import { readClaudeTranscript } from "./claude-transcript.js";
+import { readClaudeGoalRecords, readClaudeTranscript } from "./claude-transcript.js";
+import {
+  CLAUDE_GOAL_OBJECTIVE_LIMIT,
+  ClaudeGoalTracker,
+  classifyClaudeGoalCommandOutput,
+  deriveClaudeGoalFromTranscript,
+  type ClaudeGoalCommandOutcome,
+} from "./claude-goal.js";
 import {
   CLAUDE_DEFAULT_MODEL_REF,
   decodeClaudeModelRef,
@@ -103,6 +113,7 @@ import type {
   ClaudeAdapterDependencies,
   ClaudeApprovalRequest,
   ClaudeAutonomousTurn,
+  ClaudeGoalSignal,
   ClaudeInteractionRequest,
   ClaudeInteractionResponse,
   ClaudeLastRequestUsage,
@@ -183,11 +194,17 @@ interface ActiveTurn {
   usageTokensCalibrated: boolean;
   usageCostCalibrated: boolean;
   held: boolean;
+  /** Host Events buffered until native evidence confirms the Turn exists. */
+  deferredEvents: HostEvent[] | null;
+  /** The Turn was withdrawn before Host learned of it; drop everything. */
+  discarded: boolean;
   completion: Promise<void>;
   resolveCompletion(): void;
 }
 
 const claudeCodeHarnessId = harnessIdSchema.parse("claude-code");
+const GOAL_COMMAND_TIMEOUT_MS = 15_000;
+const GOAL_SETTLE_RETRY_MS = 250;
 export const claudeCommandCatalog = harnessCommandCatalogSchema.parse({
   commands: [
     {
@@ -491,8 +508,14 @@ class ClaudeHarnessSession implements HarnessSession {
     },
     history: { fork: true, forkAcrossCwd: false, rollbackLastTurn: true },
     subagents: { observe: true, readTranscript: true },
+    fileChanges: { reliable: true },
   };
   readonly commands: HarnessCommandCapability;
+  readonly goal: HarnessGoalCapability = {
+    set: (input) => this.#setGoal(input),
+    clear: () => this.#clearGoal(),
+    read: () => this.#readGoal(),
+  };
   readonly initialState: HarnessSessionState;
   readonly initialUsage = null;
   readonly outputs: AsyncIterable<HarnessOutput>;
@@ -514,6 +537,9 @@ class ClaudeHarnessSession implements HarnessSession {
   #requestedPermissionModeId: HarnessPermissionModeId;
   #requestedThinkingOptionId: HarnessThinkingOptionId;
   readonly #readSessionMessages: ClaudeAdapterDependencies["readSessionMessages"];
+  readonly #readGoalRecords: ClaudeAdapterDependencies["readGoalRecords"];
+  readonly #goalTracker = new ClaudeGoalTracker((event) => this.#event(event));
+  #pendingGoalCommand: ((outcome: ClaudeGoalCommandOutcome | null) => void) | null = null;
   readonly #sessionId: string;
   readonly #toolOutputLimit: number;
   readonly #continuationQuiescenceMs: number;
@@ -575,6 +601,7 @@ class ClaudeHarnessSession implements HarnessSession {
       : dependencies.createTransport;
     this.#randomUUID = dependencies.randomUUID;
     this.#readSessionMessages = dependencies.readSessionMessages;
+    this.#readGoalRecords = dependencies.readGoalRecords;
     this.#cancelTimeoutMs = options.cancelTimeoutMs;
     this.#closeTimeoutMs = closeTimeoutMs;
     this.#onClosed = onClosed;
@@ -785,53 +812,18 @@ class ClaudeHarnessSession implements HarnessSession {
     this.#usageGeneration += 1;
     this.#contextUsageFreshUntilMs = 0;
     this.#contextUsageCooldownUntilMs = 0;
-    let resolveCompletion = (): void => undefined;
-    const completion = new Promise<void>((resolve) => {
-      resolveCompletion = resolve;
-    });
     const nativeTurnKey = this.#randomUUID();
     const item: HostAgentMessageItem = {
       type: "agentMessage",
       itemId: claudeTranscriptItemId(nativeTurnKey, "agentMessage", 1),
       text: "",
     };
-    const active: ActiveTurn = {
+    const active = this.#createActiveTurn({
       command,
-      compactionItem: null,
       item,
-      agentMessageOrdinal: 1,
-      assistantMessageId: null,
-      reasoningItems: new Map(),
-      reasoningOrdinal: 0,
-      pendingSubagentTranscriptCalls: new Set(),
-      subagents: new ClaudeSubagentLifecycle({
-        newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
-        emit: (event) => this.#event(event),
-      }),
-      tools: new ClaudeToolLifecycle({
-        cwd: this.#cwd,
-        outputLimit: this.#toolOutputLimit,
-        taskTracker: this.#taskTracker,
-        newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
-        emit: (event) => this.#event(event),
-      }),
-      interactions: new Map(),
-      interactionByRequestId: new Map(),
-      checkpointId: null,
       nativeTurnKey,
       nativeTurnRef: null,
-      cancellationRequested: false,
-      usageRequestIds: new Set(),
-      estimatedInputTokens: 0,
-      estimatedOutputTokens: 0,
-      estimatedCostUsd: 0,
-      estimatedCostAvailable: false,
-      usageTokensCalibrated: false,
-      usageCostCalibrated: false,
-      held: false,
-      completion,
-      resolveCompletion,
-    };
+    });
     this.#active = active;
     this.#submittedInput = true;
     this.#event({ type: "turn.started", turnId: command.turnId });
@@ -894,10 +886,6 @@ class ClaudeHarnessSession implements HarnessSession {
     this.#usageGeneration += 1;
     this.#contextUsageFreshUntilMs = 0;
     this.#contextUsageCooldownUntilMs = 0;
-    let resolveCompletion = (): void => undefined;
-    const completion = new Promise<void>((resolve) => {
-      resolveCompletion = resolve;
-    });
     const nativeTurnKey = this.#randomUUID();
     const startAgentItem = parsed.value.id !== "claude.compact";
     const item: HostAgentMessageItem | null = startAgentItem
@@ -907,43 +895,12 @@ class ClaudeHarnessSession implements HarnessSession {
           text: "",
         }
       : null;
-    const active: ActiveTurn = {
+    const active = this.#createActiveTurn({
       command: { type: "turn.start", turnId: command.turnId, input: [] },
-      compactionItem: null,
       item,
-      agentMessageOrdinal: startAgentItem ? 1 : 0,
-      assistantMessageId: null,
-      reasoningItems: new Map(),
-      reasoningOrdinal: 0,
-      pendingSubagentTranscriptCalls: new Set(),
-      subagents: new ClaudeSubagentLifecycle({
-        newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
-        emit: (event) => this.#event(event),
-      }),
-      tools: new ClaudeToolLifecycle({
-        cwd: this.#cwd,
-        outputLimit: this.#toolOutputLimit,
-        taskTracker: this.#taskTracker,
-        newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
-        emit: (event) => this.#event(event),
-      }),
-      interactions: new Map(),
-      interactionByRequestId: new Map(),
-      checkpointId: null,
       nativeTurnKey,
       nativeTurnRef: null,
-      cancellationRequested: false,
-      usageRequestIds: new Set(),
-      estimatedInputTokens: 0,
-      estimatedOutputTokens: 0,
-      estimatedCostUsd: 0,
-      estimatedCostAvailable: false,
-      usageTokensCalibrated: false,
-      usageCostCalibrated: false,
-      held: false,
-      completion,
-      resolveCompletion,
-    };
+    });
     this.#active = active;
     this.#submittedInput = true;
     this.#event({ type: "turn.started", turnId: command.turnId });
@@ -1396,6 +1353,7 @@ class ClaudeHarnessSession implements HarnessSession {
         onPermissionModeChanged: (mode) => this.#handlePermissionModeChanged(mode),
         onFault: () => this.#fault(faultError()),
         onPlanLimit: (planLimit) => this.#handlePlanLimit(planLimit),
+        onGoalSignal: (signal) => this.#handleGoalSignal(signal),
       });
       this.#transport = transport;
       transport.setAutonomousTurnHandler((turn) => this.#handleAutonomousTurn(turn));
@@ -1483,7 +1441,14 @@ class ClaudeHarnessSession implements HarnessSession {
   }
 
   #handleTurnEvent(active: ActiveTurn, event: ClaudeTurnEvent): void {
-    if (this.#active !== active || this.#phase === "closed" || this.#phase === "faulted") return;
+    if (
+      this.#active !== active ||
+      active.discarded ||
+      this.#phase === "closed" ||
+      this.#phase === "faulted"
+    ) {
+      return;
+    }
     switch (event.type) {
       case "segment.started":
         this.#observeRootOutput();
@@ -1853,39 +1818,15 @@ class ClaudeHarnessSession implements HarnessSession {
     if (this.#active) return;
     this.#autonomousOrdinal += 1;
     const turnId = hostTurnIdSchema.parse(this.#randomUUID());
-    let resolveCompletion = (): void => undefined;
-    const completion = new Promise<void>((resolve) => {
-      resolveCompletion = resolve;
-    });
     const nativeTurnKey = turn.nativeTurnKey || `autonomous-${this.#autonomousOrdinal}`;
     const item: HostAgentMessageItem = {
       type: "agentMessage",
       itemId: claudeTranscriptItemId(nativeTurnKey, "agentMessage", 1),
       text: "",
     };
-    const active: ActiveTurn = {
+    const active = this.#createActiveTurn({
       command: { type: "turn.start", turnId, input: [] },
-      compactionItem: null,
       item,
-      agentMessageOrdinal: 1,
-      assistantMessageId: null,
-      reasoningItems: new Map(),
-      reasoningOrdinal: 0,
-      pendingSubagentTranscriptCalls: new Set(),
-      subagents: new ClaudeSubagentLifecycle({
-        newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
-        emit: (event) => this.#event(event),
-      }),
-      tools: new ClaudeToolLifecycle({
-        cwd: this.#cwd,
-        outputLimit: this.#toolOutputLimit,
-        taskTracker: this.#taskTracker,
-        newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
-        emit: (event) => this.#event(event),
-      }),
-      interactions: new Map(),
-      interactionByRequestId: new Map(),
-      checkpointId: null,
       nativeTurnKey,
       nativeTurnRef: nativeTurnRefSchema.parse({
         harnessId: this.harnessId,
@@ -1893,18 +1834,7 @@ class ClaudeHarnessSession implements HarnessSession {
         nativeTurnKey,
         formatVersion: 1,
       }),
-      cancellationRequested: false,
-      usageRequestIds: new Set(),
-      estimatedInputTokens: 0,
-      estimatedOutputTokens: 0,
-      estimatedCostUsd: 0,
-      estimatedCostAvailable: false,
-      usageTokensCalibrated: false,
-      usageCostCalibrated: false,
-      held: false,
-      completion,
-      resolveCompletion,
-    };
+    });
     this.#active = active;
     this.#event({ type: "turn.autonomous.started", turnId, input: [] });
     this.#event({ type: "turn.started", turnId });
@@ -1938,6 +1868,303 @@ class ClaudeHarnessSession implements HarnessSession {
   #interruptBackgroundSubagents(status: "failed" | "interrupted"): void {
     for (const nativeSubagentId of this.#occupancy.interruptAll()) {
       this.#event({ type: "subagent.state.changed", nativeSubagentId, status });
+    }
+  }
+
+  #createActiveTurn(input: {
+    command: TurnStartCommand;
+    item: HostAgentMessageItem | null;
+    nativeTurnKey: string;
+    nativeTurnRef: NativeTurnRef | null;
+  }): ActiveTurn {
+    let resolveCompletion = (): void => undefined;
+    const completion = new Promise<void>((resolve) => {
+      resolveCompletion = resolve;
+    });
+    return {
+      command: input.command,
+      compactionItem: null,
+      item: input.item,
+      agentMessageOrdinal: input.item ? 1 : 0,
+      assistantMessageId: null,
+      reasoningItems: new Map(),
+      reasoningOrdinal: 0,
+      pendingSubagentTranscriptCalls: new Set(),
+      subagents: new ClaudeSubagentLifecycle({
+        newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
+        emit: (event) => this.#event(event),
+      }),
+      tools: new ClaudeToolLifecycle({
+        cwd: this.#cwd,
+        outputLimit: this.#toolOutputLimit,
+        taskTracker: this.#taskTracker,
+        newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
+        emit: (event) => this.#event(event),
+      }),
+      interactions: new Map(),
+      interactionByRequestId: new Map(),
+      checkpointId: null,
+      nativeTurnKey: input.nativeTurnKey,
+      nativeTurnRef: input.nativeTurnRef,
+      cancellationRequested: false,
+      usageRequestIds: new Set(),
+      estimatedInputTokens: 0,
+      estimatedOutputTokens: 0,
+      estimatedCostUsd: 0,
+      estimatedCostAvailable: false,
+      usageTokensCalibrated: false,
+      usageCostCalibrated: false,
+      held: false,
+      deferredEvents: null,
+      discarded: false,
+      completion,
+      resolveCompletion,
+    };
+  }
+
+  /**
+   * Waits for the next `/goal` local command acknowledgement. Claude prints it
+   * synchronously before any model work, so a bounded wait covers process
+   * startup without masking a wedged transport.
+   */
+  async #awaitGoalCommandOutput(
+    transport: ClaudeTurnTransport,
+    running: Promise<ClaudeTransportTurnResult>,
+  ): Promise<ClaudeGoalCommandOutcome | null> {
+    let timedOut = false;
+    const outcome = await new Promise<ClaudeGoalCommandOutcome | null>((resolve) => {
+      const settle = (value: ClaudeGoalCommandOutcome | null): void => {
+        if (this.#pendingGoalCommand !== settle) return;
+        this.#pendingGoalCommand = null;
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const timer = setTimeout(() => {
+        timedOut = true;
+        settle(null);
+      }, GOAL_COMMAND_TIMEOUT_MS);
+      timer.unref();
+      this.#pendingGoalCommand = settle;
+      void running.then(
+        () => settle(null),
+        () => settle(null),
+      );
+    });
+    // A wedged native command must not leave the transport busy forever.
+    if (timedOut) await transport.abort().catch(() => undefined);
+    return outcome;
+  }
+
+  #handleGoalSignal(signal: ClaudeGoalSignal): void {
+    if (this.#phase !== "open") return;
+    if (signal.type === "command" && this.#pendingGoalCommand) {
+      this.#pendingGoalCommand(classifyClaudeGoalCommandOutput(signal.output));
+      return;
+    }
+    this.#goalTracker.apply(signal);
+  }
+
+  async #setGoal(input: {
+    turnId: TurnStartCommand["turnId"];
+    objective: string;
+  }): Promise<HarnessResult<TurnStartAccepted>> {
+    if (this.#phase !== "open") {
+      return { ok: false, error: invalidState("Claude Code Session is not open") };
+    }
+    const objective = input.objective.trim();
+    if (objective.length === 0 || objective.length > CLAUDE_GOAL_OBJECTIVE_LIMIT) {
+      return {
+        ok: false,
+        error: {
+          code: "invalidRequest",
+          message: `Claude Code Goal objective must be 1 to ${CLAUDE_GOAL_OBJECTIVE_LIMIT} characters`,
+          retryable: false,
+        },
+      };
+    }
+    if (this.#acceptingTurn || this.#active || this.#configurationTask || this.#readingHistory) {
+      return {
+        ok: false,
+        error: {
+          code: "sessionBusy",
+          message: "Claude Code Session already has an active operation",
+          retryable: true,
+        },
+      };
+    }
+    this.#acceptingTurn = true;
+    const startingTransport = this.#transport === null;
+    let transport: ClaudeTurnTransport;
+    try {
+      transport = await this.#ensureTransport();
+    } catch (error) {
+      this.#acceptingTurn = false;
+      return { ok: false, error: startupFailure(error) };
+    }
+    this.#acceptingTurn = false;
+    if (this.#phase !== "open") {
+      return { ok: false, error: invalidState("Claude Code Session closed during startup") };
+    }
+    if (startingTransport) this.#publishState();
+    this.#usageGeneration += 1;
+    this.#contextUsageFreshUntilMs = 0;
+    this.#contextUsageCooldownUntilMs = 0;
+    const nativeTurnKey = this.#randomUUID();
+    const nativeTurnRef = nativeTurnRefSchema.parse({
+      harnessId: this.harnessId,
+      nativeSessionId: this.#sessionId,
+      nativeTurnKey,
+      formatVersion: 1,
+    });
+    // The objective is the native `/goal` directive, not visible user input.
+    const active = this.#createActiveTurn({
+      command: { type: "turn.start", turnId: input.turnId, input: [] },
+      item: {
+        type: "agentMessage",
+        itemId: claudeTranscriptItemId(nativeTurnKey, "agentMessage", 1),
+        text: "",
+      },
+      nativeTurnKey,
+      nativeTurnRef,
+    });
+    active.deferredEvents = [];
+    this.#active = active;
+    const running = transport.goal(objective, nativeTurnKey, (event) => {
+      this.#handleTurnEvent(active, event);
+    });
+    const outcome = await this.#awaitGoalCommandOutput(transport, running);
+    if (this.#active !== active || this.#phase !== "open") {
+      return {
+        ok: false,
+        error: invalidState("Claude Code Session closed while setting the Goal"),
+      };
+    }
+    if (outcome?.kind !== "set") {
+      // Nothing reached Host yet, so the Turn can be withdrawn silently.
+      active.discarded = true;
+      active.deferredEvents = null;
+      this.#active = null;
+      active.resolveCompletion();
+      await running.catch(() => undefined);
+      return {
+        ok: false,
+        error:
+          outcome?.kind === "error"
+            ? outcome.error
+            : {
+                code: "nativeFailure",
+                message: "Claude Code did not acknowledge the Goal",
+                retryable: true,
+              },
+      };
+    }
+    const deferred = active.deferredEvents;
+    active.deferredEvents = null;
+    this.#event({ type: "turn.started", turnId: input.turnId });
+    if (active.item) this.#event({ type: "item.started", turnId: input.turnId, item: active.item });
+    for (const event of deferred ?? []) this.#event(event);
+    this.#goalTracker.confirmSet(outcome.objective);
+    void running.then(
+      (result) => this.#finishResult(active, result),
+      () => this.#handleTurnTransportFailure(active),
+    );
+    return { ok: true, value: { turnId: input.turnId } };
+  }
+
+  async #clearGoal(): Promise<HarnessResult<GoalClearCompleted>> {
+    if (this.#phase !== "open") {
+      return { ok: false, error: invalidState("Claude Code Session is not open") };
+    }
+    if (this.#acceptingTurn || this.#active || this.#configurationTask || this.#readingHistory) {
+      return {
+        ok: false,
+        error: {
+          code: "sessionBusy",
+          message: "Claude Code Session already has an active operation",
+          retryable: true,
+        },
+      };
+    }
+    let release = (): void => undefined;
+    this.#configurationTask = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const startingTransport = this.#transport === null;
+    try {
+      const transport = await this.#ensureTransport();
+      if (this.#phase !== "open") {
+        return { ok: false, error: invalidState("Claude Code Session closed during startup") };
+      }
+      if (startingTransport) this.#publishState();
+      // A local command only: Claude prints the acknowledgement and ends the
+      // native Turn without model work, so nothing is projected to Host.
+      const running = transport.clearGoal(this.#randomUUID(), () => undefined);
+      const outcome = await this.#awaitGoalCommandOutput(transport, running);
+      await running.catch(() => undefined);
+      if (outcome?.kind === "cleared") {
+        this.#goalTracker.confirmCleared();
+        return { ok: true, value: { cleared: true } };
+      }
+      if (outcome?.kind === "noGoal") {
+        this.#goalTracker.reconcile({ goal: null, outcome: "cleared" });
+        return { ok: true, value: { cleared: false } };
+      }
+      return {
+        ok: false,
+        error:
+          outcome?.kind === "error"
+            ? outcome.error
+            : {
+                code: "nativeFailure",
+                message: "Claude Code did not acknowledge the Goal clear",
+                retryable: true,
+              },
+      };
+    } catch (error) {
+      return { ok: false, error: startupFailure(error) };
+    } finally {
+      this.#configurationTask = null;
+      release();
+    }
+  }
+
+  async #readGoal(): Promise<HarnessResult<GoalReadCompleted>> {
+    if (this.#phase !== "open") {
+      return { ok: false, error: invalidState("Claude Code Session is not open") };
+    }
+    let records: unknown[];
+    try {
+      records = await this.#readGoalRecords({ cwd: this.#cwd, sessionId: this.#sessionId });
+    } catch {
+      return {
+        ok: false,
+        error: {
+          code: "nativeFailure",
+          message: "Claude Code Goal history could not be read",
+          retryable: true,
+        },
+      };
+    }
+    this.#goalTracker.reconcile(deriveClaudeGoalFromTranscript(records), false);
+    return { ok: true, value: { goal: this.#goalTracker.goal } };
+  }
+
+  /**
+   * Claude reports a Goal's terminal verdict only in its transcript. Once a
+   * Turn settles, reconcile so achieved or unachievable Goals reach Host.
+   */
+  async #settleGoalAfterTurn(): Promise<void> {
+    if (this.#goalTracker.goal === null) return;
+    for (const delayMs of [0, GOAL_SETTLE_RETRY_MS]) {
+      if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      if (this.#phase !== "open") return;
+      let records: unknown[];
+      try {
+        records = await this.#readGoalRecords({ cwd: this.#cwd, sessionId: this.#sessionId });
+      } catch {
+        return;
+      }
+      if (this.#goalTracker.reconcile(deriveClaudeGoalFromTranscript(records))) return;
     }
   }
 
@@ -2305,6 +2532,7 @@ class ClaudeHarnessSession implements HarnessSession {
     this.#occupancy.clear();
     this.#transport?.setIdleLive(false);
     active.resolveCompletion();
+    void this.#settleGoalAfterTurn();
   }
 
   #handleTurnTransportFailure(active: ActiveTurn): void {
@@ -2375,6 +2603,11 @@ class ClaudeHarnessSession implements HarnessSession {
   }
 
   #event(event: HostEvent): void {
+    const active = this.#active;
+    if (active?.deferredEvents) {
+      active.deferredEvents.push(event);
+      return;
+    }
     this.#channel.emit({ kind: "event", event });
   }
 }
@@ -2503,6 +2736,12 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
         });
         return transcript ?? [];
       },
+      readGoalRecords: async ({ cwd, sessionId }) =>
+        (await readClaudeGoalRecords({
+          cwd,
+          environment: options.environment ?? process.env,
+          sessionId,
+        })) ?? [],
       readSubagentMessages: ({ cwd, sessionId, nativeSubagentId }) =>
         getSubagentMessages(sessionId, nativeSubagentId, { dir: cwd }),
     };
@@ -2602,6 +2841,7 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
           },
           history: { fork: true, forkAcrossCwd: false, rollbackLastTurn: true },
           subagents: { observe: true, readTranscript: true },
+          fileChanges: { reliable: true },
         },
       };
     } catch (error) {

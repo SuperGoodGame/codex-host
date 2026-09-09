@@ -85,3 +85,41 @@ export async function readClaudeTranscript(input: {
   }
   return messages;
 }
+
+/**
+ * Reads the Goal status records Claude appends to its main-session transcript.
+ *
+ * Claude persists every `/goal` transition as a `goal_status` attachment: a
+ * sentinel when a Goal is set or cleared, and an evaluator verdict after each
+ * Stop hook round. SDK hosts receive none of these on the message stream, so
+ * they are the only native evidence of a Goal's terminal outcome and of a Goal
+ * restored by session resume.
+ */
+export async function readClaudeGoalRecords(input: {
+  cwd: string;
+  environment: NodeJS.ProcessEnv;
+  sessionId: string;
+}): Promise<unknown[] | null> {
+  const transcript = await findTranscript(input);
+  if (!transcript) return null;
+  const contents = await readFile(transcript, "utf8");
+  const records: unknown[] = [];
+  for (const line of contents.split("\n")) {
+    if (!line.includes('"goal_status"')) continue;
+    let entry: unknown;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (
+      isRecord(entry) &&
+      entry.type === "attachment" &&
+      isRecord(entry.attachment) &&
+      entry.attachment.type === "goal_status"
+    ) {
+      records.push(entry);
+    }
+  }
+  return records;
+}

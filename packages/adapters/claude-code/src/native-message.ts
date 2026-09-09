@@ -2,6 +2,7 @@ import { jsonValueSchema } from "@codexhost/shared-contracts";
 
 import { parseClaudeNativeFileChange } from "./file-change.js";
 import type {
+  ClaudeGoalSignal,
   ClaudePlanLimitEvent,
   ClaudeTransportFailureKind,
   ClaudeTransportTurnResult,
@@ -265,6 +266,50 @@ function parsePlanLimitWindow(
  * documents) is accepted as a fallback for a single primary window when
  * `unifiedWindows` is absent.
  */
+const goalCommandOutputPattern =
+  /^(?:Goal set: |Goal cleared: |No goal set|Goal active: |Goal condition is limited to |\/goal )/u;
+const stopHookFeedbackPattern = /^Stop hook feedback:\n\[([\s\S]*?)\]: ([\s\S]*)$/u;
+const goalErrorNoticePrefix = "Goal cleared after an unrecoverable error";
+
+function singleTextBlock(content: unknown): string | null {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content) || content.length !== 1) return null;
+  const block = content[0];
+  return isRecord(block) && block.type === "text" && typeof block.text === "string"
+    ? block.text
+    : null;
+}
+
+/**
+ * Recognises the native Goal evidence Claude exposes to SDK hosts: `/goal`
+ * local command output (a synthetic Assistant message), the Stop hook's
+ * not-yet-met verdict (a meta User message), and the unrecoverable-error notice.
+ */
+export function parseClaudeGoalSignal(message: unknown): ClaudeGoalSignal | null {
+  if (!isRecord(message) || parentToolUseId(message) !== null) return null;
+  if (message.type === "assistant" && isRecord(message.message)) {
+    if (message.message.model !== "<synthetic>") return null;
+    const text = singleTextBlock(message.message.content);
+    if (text === null || !goalCommandOutputPattern.test(text)) return null;
+    return { type: "command", output: text };
+  }
+  if (message.type === "user" && isRecord(message.message)) {
+    const text = singleTextBlock(message.message.content);
+    const match = text === null ? null : stopHookFeedbackPattern.exec(text);
+    if (!match) return null;
+    return { type: "verdict", condition: match[1] ?? "", reason: (match[2] ?? "").trim() };
+  }
+  if (
+    message.type === "system" &&
+    message.subtype === "informational" &&
+    typeof message.content === "string" &&
+    message.content.startsWith(goalErrorNoticePrefix)
+  ) {
+    return { type: "clearedByError", reason: message.content };
+  }
+  return null;
+}
+
 export function parseClaudePlanLimitEvent(message: unknown): ClaudePlanLimitEvent | null {
   if (!isRecord(message) || message.type !== "rate_limit_event") return null;
   const info = message.rate_limit_info;

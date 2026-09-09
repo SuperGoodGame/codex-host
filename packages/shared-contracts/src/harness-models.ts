@@ -180,6 +180,17 @@ export const harnessSessionCapabilitiesSchema = z
       })
       .strict()
       .optional(),
+    /**
+     * Omission means the Harness supplies no File Change evidence of its own, so
+     * generic projection may still infer File Changes from Tool input.
+     */
+    fileChanges: z
+      .object({
+        /** The Adapter emits every File Change from native patch evidence. */
+        reliable: z.boolean(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 

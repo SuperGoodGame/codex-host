@@ -391,6 +391,68 @@ describe("Claude history mapping", () => {
     ]);
   });
 
+  it("shows /goal objectives as Turn input and hides Goal status and clear control records", () => {
+    const history = [
+      message(
+        "user",
+        "goal-status",
+        "<command-name>/goal</command-name>\n<command-message>goal</command-message>\n<command-args></command-args>",
+      ),
+      message(
+        "user",
+        "goal-status-output",
+        "<local-command-stdout>No goal set. Usage: `/goal <condition>`</local-command-stdout>",
+      ),
+      message(
+        "user",
+        "goal-set",
+        "<command-name>/goal</command-name>\n<command-message>goal</command-message>\n<command-args>count.txt contains 3</command-args>",
+      ),
+      message(
+        "user",
+        "goal-set-output",
+        "<local-command-stdout>Goal set: count.txt contains 3</local-command-stdout>",
+      ),
+      {
+        ...message("user", "goal-directive", "A session-scoped Stop hook is now active"),
+        isMeta: true,
+      },
+      message("assistant", "assistant-goal", "Created count.txt with 1", "end_turn"),
+      message(
+        "user",
+        "goal-clear",
+        "<command-name>/goal</command-name>\n<command-message>goal</command-message>\n<command-args>clear</command-args>",
+      ),
+      message(
+        "user",
+        "goal-clear-output",
+        "<local-command-stdout>Goal cleared: count.txt contains 3</local-command-stdout>",
+      ),
+      message("user", "user-2", "next"),
+      message("assistant", "assistant-2", "ok", "end_turn"),
+    ];
+
+    expect(mapClaudeSnapshot(history, sessionId).turns).toMatchObject([
+      {
+        nativeTurnRef: { nativeTurnKey: "goal-set" },
+        input: [{ type: "text", text: "/goal count.txt contains 3" }],
+        items: [
+          {
+            item: {
+              type: "agentMessage",
+              itemId: "claude-item-v2-goal-set-agentMessage-1",
+              text: "Created count.txt with 1",
+            },
+          },
+        ],
+      },
+      {
+        nativeTurnRef: { nativeTurnKey: "user-2" },
+        input: [{ type: "text", text: "next" }],
+      },
+    ]);
+  });
+
   it("omits Claude background task-notification records without hiding later human Turns", () => {
     const notification = `<task-notification>
 <task-id>a7b2e1021a9dc42e0</task-id>

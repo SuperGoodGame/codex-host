@@ -91,6 +91,7 @@ async function fixture(turns = 1) {
     readSessionMessages: vi.fn(async ({ sessionId }) =>
       structuredClone(histories.get(sessionId) ?? []),
     ),
+    readGoalRecords: async () => [],
     readSubagentMessages: async () => [],
     createTransport: vi.fn((input) => {
       let permissionMode = input.permissionMode;
@@ -114,6 +115,8 @@ async function fixture(turns = 1) {
         compact: async () => ({ status: "succeeded" as const }),
         init: async () => ({ status: "succeeded" as const }),
         recap: async () => ({ status: "succeeded" as const }),
+        goal: async () => ({ status: "succeeded" as const }),
+        clearGoal: async () => ({ status: "succeeded" as const }),
         runTurn: async (text, userMessageId, onEvent) => {
           const next = messages(input.sessionId, text);
           assert.ok(next[0]);

@@ -20,12 +20,13 @@ import { CodexTurnProjector, projectHistoricalTurn } from "../src/index.js";
 const turnId = hostTurnIdSchema.parse("turn-1");
 const itemId = (value: string) => hostItemIdSchema.parse(value);
 
-function projector(): CodexTurnProjector {
+function projector(inferFileChangesFromTools = true): CodexTurnProjector {
   return new CodexTurnProjector({
     threadId: "thread-1",
     turnId,
     cwd: "/workspace",
     startedAtMs: 1_000,
+    inferFileChangesFromTools,
   });
 }
 
@@ -1271,6 +1272,79 @@ describe("Codex UI projector", () => {
         { type: "fileChange", id: "file-2", status: "completed" },
       ],
     });
+  });
+
+  it("keeps a mutating Tool Item intact when the Harness owns File Changes", () => {
+    const value = projector(false);
+    const editId = itemId("edit-2");
+    value.project({ type: "turn.started", turnId });
+    const started = value.project({
+      type: "item.started",
+      turnId,
+      item: {
+        type: "toolExecution",
+        itemId: editId,
+        toolName: "Edit",
+        arguments: { path: "src/app.ts", old_string: "a", new_string: "b" },
+      },
+    });
+    expect(started.messages.map(({ method }) => method)).toEqual(["item/started"]);
+    expect(started.messages[0]).toMatchObject({
+      params: { item: { id: "edit-2", type: "dynamicToolCall" } },
+    });
+  });
+
+  it("keeps a mutating Tool Item that supplies no inferable input", () => {
+    const value = projector(false);
+    const multiId = itemId("multi-edit-1");
+    value.project({ type: "turn.started", turnId });
+    const started = value.project({
+      type: "item.started",
+      turnId,
+      item: {
+        type: "toolExecution",
+        itemId: multiId,
+        toolName: "MultiEdit",
+        arguments: { file_path: "src/app.ts", edits: [{ old_string: "a", new_string: "b" }] },
+      },
+    });
+    expect(started.messages.map(({ method }) => method)).toEqual(["item/started"]);
+  });
+
+  it("summarises repeated edits of one file as a single Turn Diff section", () => {
+    const value = projector(false);
+    value.project({ type: "turn.started", turnId });
+    const edit = (suffix: string, diff: string): HostFileChangeItem => ({
+      type: "fileChange",
+      itemId: itemId(`plan-${suffix}`),
+      changes: [{ path: "PLAN.md", kind: "update", unifiedDiff: diff }],
+    });
+    value.project({
+      type: "item.started",
+      turnId,
+      item: edit(
+        "1",
+        "--- /workspace/PLAN.md\n+++ /workspace/PLAN.md\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+      ),
+    });
+    const second = value.project({
+      type: "item.started",
+      turnId,
+      item: edit(
+        "2",
+        "--- /workspace/PLAN.md\n+++ /workspace/PLAN.md\n@@ -9,1 +9,2 @@\n-gone\n+kept\n+extra\n",
+      ),
+    });
+    const diff = (second.messages[2] as { params: { diff: string } }).params.diff;
+    const lines = diff.split("\n");
+    expect(lines.filter((line) => line.startsWith("--- "))).toEqual(["--- /workspace/PLAN.md"]);
+    expect(lines.filter((line) => line.startsWith("+++ "))).toEqual(["+++ /workspace/PLAN.md"]);
+    expect(lines.filter((line) => line.startsWith("@@"))).toHaveLength(2);
+    expect(lines.filter((line) => line.startsWith("+") && !line.startsWith("+++"))).toEqual([
+      "+new",
+      "+kept",
+      "+extra",
+    ]);
   });
 
   it("projects standalone Questions through a synthetic Generic Tool lifecycle", () => {

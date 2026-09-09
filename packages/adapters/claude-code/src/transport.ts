@@ -166,6 +166,16 @@ export interface ClaudePlanLimitEvent {
   sevenDay?: ClaudePlanLimitWindow;
 }
 
+/**
+ * Native evidence about Claude's session Goal observed on the SDK stream.
+ * Claude never sends `active_goal` frames to SDK hosts, so Goal state is read
+ * from `/goal` command output, Stop hook verdicts, and error notices instead.
+ */
+export type ClaudeGoalSignal =
+  | { type: "command"; output: string }
+  | { type: "verdict"; condition: string; reason: string }
+  | { type: "clearedByError"; reason: string };
+
 export interface ClaudeAutonomousTurn {
   nativeTurnKey: string;
   events: ClaudeTurnEvent[];
@@ -201,6 +211,17 @@ export interface ClaudeTurnTransport {
     userMessageId: string,
     onEvent: (event: ClaudeTurnEvent) => void,
   ): Promise<ClaudeTransportTurnResult>;
+  /** Native `/goal <objective>`: Claude sets the Goal and starts its first Turn. */
+  goal(
+    objective: string,
+    userMessageId: string,
+    onEvent: (event: ClaudeTurnEvent) => void,
+  ): Promise<ClaudeTransportTurnResult>;
+  /** Native `/goal clear`: a local command with no model Turn. */
+  clearGoal(
+    userMessageId: string,
+    onEvent: (event: ClaudeTurnEvent) => void,
+  ): Promise<ClaudeTransportTurnResult>;
   runTurn(
     text: string,
     userMessageId: string,
@@ -222,6 +243,7 @@ export interface ClaudeTransportFactoryInput {
   onPermissionModeChanged(permissionMode: ClaudePermissionMode): void;
   onFault(error: unknown): void;
   onPlanLimit(planLimit: ClaudePlanLimitEvent): void;
+  onGoalSignal(signal: ClaudeGoalSignal): void;
 }
 
 export interface ClaudeModelInspector {
@@ -247,6 +269,8 @@ export interface ClaudeAdapterDependencies {
   getSessionInfo(input: { sessionId: string }): Promise<{ cwd?: string } | undefined>;
   inspectInstallation(): void;
   readSessionMessages(input: { cwd: string; sessionId: string }): Promise<unknown[]>;
+  /** Native `goal_status` transcript records, in order; empty when none exist. */
+  readGoalRecords(input: { cwd: string; sessionId: string }): Promise<unknown[]>;
   readSubagentMessages(input: {
     cwd: string;
     sessionId: string;

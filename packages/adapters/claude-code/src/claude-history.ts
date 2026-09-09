@@ -51,6 +51,9 @@ const commandEnvelopePattern = /^\s*(?:<(command-(?:message|name|args))>[\s\S]*?
 const controlCommandNamePattern = /<command-name>\s*\/(?:model|compact)\s*<\/command-name>/u;
 const recapCommandNamePattern = /<command-name>\s*\/recap\s*<\/command-name>/u;
 const initCommandNamePattern = /<command-name>\s*\/init\s*<\/command-name>/u;
+const goalCommandNamePattern = /<command-name>\s*\/goal\s*<\/command-name>/u;
+const commandArgsPattern = /<command-args>([\s\S]*?)<\/command-args>/u;
+const goalClearAliases = new Set(["clear", "stop", "off", "reset", "none", "cancel"]);
 const localCommandStdoutPattern =
   /^\s*<local-command-stdout>([\s\S]*)<\/local-command-stdout>\s*$/u;
 
@@ -62,8 +65,21 @@ function isTaskNotificationRecord(text: string): boolean {
   return taskNotificationRecordPattern.test(text);
 }
 
+/**
+ * `/goal <objective>` starts native work and is shown like `/init`; status
+ * (`/goal`) and clear (`/goal clear` and its aliases) are control-only.
+ */
+function goalCommandObjective(text: string): string | null {
+  if (!commandEnvelopePattern.test(text) || !goalCommandNamePattern.test(text)) return null;
+  const objective = (commandArgsPattern.exec(text)?.[1] ?? "").trim();
+  if (objective.length === 0 || goalClearAliases.has(objective.toLowerCase())) return null;
+  return objective;
+}
+
 function isControlCommandEnvelope(text: string): boolean {
-  return commandEnvelopePattern.test(text) && controlCommandNamePattern.test(text);
+  if (!commandEnvelopePattern.test(text)) return false;
+  if (controlCommandNamePattern.test(text)) return true;
+  return goalCommandNamePattern.test(text) && goalCommandObjective(text) === null;
 }
 
 function isNamedCommandEnvelope(text: string, namePattern: RegExp): boolean {
@@ -73,6 +89,8 @@ function isNamedCommandEnvelope(text: string, namePattern: RegExp): boolean {
 function displayedUserText(text: string): string {
   if (isNamedCommandEnvelope(text, initCommandNamePattern)) return "/init";
   if (isNamedCommandEnvelope(text, recapCommandNamePattern)) return "/recap";
+  const objective = goalCommandObjective(text);
+  if (objective !== null) return `/goal ${objective}`;
   return text;
 }
 

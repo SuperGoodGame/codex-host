@@ -157,7 +157,7 @@ describe("release Host and independent plugin Bundles", () => {
         repositoryRoot,
         outputPath: path.join(app, "host-runtime.mjs"),
       });
-      expect(hostAudit.runtimePackages).toEqual(["ws", "zod"]);
+      expect(hostAudit.runtimePackages).toEqual(["diff", "ws", "zod"]);
       const pluginAudits = await buildPreinstalledHarnessPlugins({
         repositoryRoot,
         outputDirectory: path.join(app, "plugins"),
@@ -174,7 +174,7 @@ describe("release Host and independent plugin Bundles", () => {
         "@opencode-ai/sdk",
       );
       expect(pluginAudits.find(({ id }) => id === "deepseek-harness").runtimePackages).toContain(
-        "@deepseek-ai/dsh-host-apiproxy",
+        "@deepseek-ai/schemastery",
       );
       const source = await readFile(path.join(app, "host-runtime.mjs"), "utf8");
       expect(source).not.toContain("class ClaudeCodeAdapter");

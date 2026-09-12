@@ -147,6 +147,7 @@ describe("AppServerHost hermetic Claude projection", () => {
           },
         ];
       },
+      readGoalRecords: async () => [],
       readSubagentMessages: async () => [],
       createTransport: (input) => {
         nativeSessionId = input.sessionId;
@@ -155,6 +156,7 @@ describe("AppServerHost hermetic Claude projection", () => {
           sessionId: input.sessionId,
           setAutonomousTurnHandler: () => undefined,
           setIdleTurnHandler: () => undefined,
+          setThreadEventHandler: () => undefined,
           setIdleLive: () => undefined,
           start: async () => undefined,
           getContextUsage: async () => ({

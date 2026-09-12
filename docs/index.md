@@ -17,6 +17,7 @@
 | [`harness-plugin-architecture.md`](harness-plugin-architecture.md) | 目标架构与分阶段迁移方案：分析目录发现式 Harness 插件架构、现有耦合、行为保持、风险与验收标准；完整迁移尚未完成。 |
 | [`harness-plugin-runtime.md`](harness-plugin-runtime.md) | 插件运行时实现：七个 Harness 统一动态加载、预装发行、目录与工厂契约、安全边界和剩余迁移目标。 |
 | [`harness-command-integration.md`](harness-command-integration.md) | 说明新增 Harness 原生命令时的 Adapter、Host、Renderer 边界和验证要求。 |
+| [`external-thread-goal.md`](external-thread-goal.md) | 说明 Codex Desktop `/goal` 如何桥接到 Harness 自己的 Goal、Host 的状态映射与 Claude Code 的原生证据来源。 |
 | [`claude-code-plan-mode.md`](claude-code-plan-mode.md) | 说明 Claude Code 规划模式、显式计划退出确认及原生权限状态边界。 |
 | [`harness-executable-discovery.md`](harness-executable-discovery.md) | 说明外部 Harness CLI 的跨平台发现机制、当前接入范围和剩余限制。 |
 | [`acp-layer-follow-up.md`](acp-layer-follow-up.md) | 记录未来出现第二个生产 ACP Harness 后抽取共享 ACP 层的触发条件和边界。 |
@@ -40,11 +41,16 @@
 | 文档 | 作用 |
 |---|---|
 | [`archive/codex-desktop-incidents/26.814-compatibility-debt.md`](archive/codex-desktop-incidents/26.814-compatibility-debt.md) | 归档 Codex Desktop 26.814 更新导致 Renderer Request Bridge 和 Agent/Model 路由异常的事故记录。 |
+| [`archive/codex-desktop-incidents/26.908-request-manager-wrapper.md`](archive/codex-desktop-incidents/26.908-request-manager-wrapper.md) | 归档 Codex Desktop 26.908 把 Request Manager 包进 Fiber hook `{ hostId, manager, status }` 后连接检查失败的记录。 |
 
 ### DeepSeek Harness 接入
 
 | 文档 | 作用 |
 |---|---|
+| [`harness-executable-discovery.md`](harness-executable-discovery.md#deepseek-harness-的特殊性) | 当前 DSH `0.1.2-rc.1` / `0.1.5-rc.1` 精确支持范围、托管 Web 与连接诊断。 |
+| [`dsh-edit-recovery.md`](dsh-edit-recovery.md) | 两版原生停止确认、消息修订、Fork 与 V0/V3 checkpoint 隔离。 |
+| [`dsh-015rc1-validation.md`](dsh-015rc1-validation.md) | 双版本测试、真实 CLI 生命周期、覆盖率与协议源码证据。 |
+| [`harness-session-import.md`](harness-session-import.md) | 本地 DSH 与 Pi 原生会话导入契约及恢复边界。 |
 | [`archive/deepseek-integration/deepseek-harness-integration-analysis.md`](archive/deepseek-integration/deepseek-harness-integration-analysis.md) | 归档 DeepSeek Harness 接入前后的接口调研、候选方案和分阶段实施分析。 |
 
 ### Grok 接入

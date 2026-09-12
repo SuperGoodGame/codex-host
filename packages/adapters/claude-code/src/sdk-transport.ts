@@ -15,7 +15,11 @@ import { projectClaudeAccountUsage } from "./account-usage.js";
 
 import { resolveClaudeCodeExecutable, withNodeRuntimeOnPath } from "./command.js";
 import type { ClaudeModelInspectionSnapshot } from "./model-catalog.js";
-import { ClaudeNativeTurnAccumulator, parseClaudePlanLimitEvent } from "./native-message.js";
+import {
+  ClaudeNativeTurnAccumulator,
+  parseClaudeGoalSignal,
+  parseClaudePlanLimitEvent,
+} from "./native-message.js";
 import { isClaudePermissionMode, type ClaudePermissionMode } from "./permission-modes.js";
 import { closeClaudeProcessGroup } from "./process-fence.js";
 import { claudeThinkingConfiguration, parseClaudeThinkingOptionId } from "./thinking-options.js";
@@ -23,6 +27,7 @@ import type {
   ClaudeApprovalRequest,
   ClaudeApprovalSuggestionScope,
   ClaudeAutonomousTurn,
+  ClaudeGoalSignal,
   ClaudeIdleTurnHandler,
   ClaudeInteractionRequest,
   ClaudeInteractionResponse,
@@ -36,6 +41,10 @@ import type {
 } from "./transport.js";
 
 const CLIENT_APP = "codexhost-claude-code-adapter/0.0.0";
+// Claude Code deliberately omits sdk-cli/sdk-ts/sdk-py transcripts from its
+// interactive resume picker. The Agent SDK supplies sdk-ts when this variable
+// is absent, so identify persisted codexhost sessions explicitly instead.
+const CODEXHOST_ENTRYPOINT = "codexhost";
 const APPROVAL_TITLE_MAX_LENGTH = 120;
 const APPROVAL_DESCRIPTION_MAX_LENGTH = 500;
 const DEFAULT_ABORT_TIMEOUT_MS = 2_000;
@@ -105,6 +114,7 @@ export interface ClaudeSdkTransportOptions {
   onPermissionModeChanged(permissionMode: ClaudePermissionMode): void;
   onFault(error: unknown): void;
   onPlanLimit(planLimit: ClaudePlanLimitEvent): void;
+  onGoalSignal?(signal: ClaudeGoalSignal): void;
   queryFactory?: typeof query;
 }
 
@@ -134,6 +144,14 @@ function rejectAfter(
       if (timeoutId !== undefined) clearTimeout(timeoutId);
     },
   };
+}
+
+function claudeProcessEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return withNodeRuntimeOnPath({
+    ...environment,
+    CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP,
+    CLAUDE_CODE_ENTRYPOINT: CODEXHOST_ENTRYPOINT,
+  });
 }
 
 export function allowsDangerouslySkipPermissions(
@@ -337,6 +355,30 @@ function allowed(
   };
 }
 
+function canDeliverSettlementImmediately(
+  event: ClaudeTurnEvent,
+  pendingEvents: readonly ClaudeTurnEvent[],
+): boolean {
+  if (event.type !== "subagent.settled") return false;
+  // A notification without a continuation may never produce a Terminal. Deliver
+  // it now unless this batch still owes the child its creation/reactivation.
+  // Otherwise Host would discard the unknown child's terminal state and later
+  // replay its buffered lifecycle as running.
+  return !pendingEvents.some((pending) => {
+    if (
+      pending.type !== "subagent.started" &&
+      pending.type !== "subagent.updated" &&
+      pending.type !== "subagent.completed"
+    ) {
+      return false;
+    }
+    return (
+      (event.callId !== undefined && pending.callId === event.callId) ||
+      pending.nativeSubagentId === event.nativeSubagentId
+    );
+  });
+}
+
 export class ClaudeSdkTransport implements ClaudeTurnTransport {
   readonly sessionId: string;
   readonly #children: ChildProcessWithoutNullStreams[] = [];
@@ -350,6 +392,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
   readonly #onFault: (error: unknown) => void;
   readonly #onPermissionModeChanged: (permissionMode: ClaudePermissionMode) => void;
   readonly #onPlanLimit: (planLimit: ClaudePlanLimitEvent) => void;
+  readonly #onGoalSignal: ((signal: ClaudeGoalSignal) => void) | undefined;
   readonly #openMode: "create" | "resume";
   #permissionMode: ClaudePermissionMode;
   readonly #queryFactory: typeof query;
@@ -362,6 +405,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
   } | null = null;
   #autonomousTurnHandler: ((turn: ClaudeAutonomousTurn) => void) | null = null;
   #idleHandler: ClaudeIdleTurnHandler | null = null;
+  #threadEventHandler: ((event: ClaudeTurnEvent) => void) | null = null;
   #idleLive = false;
   #idleAccumulator: ClaudeNativeTurnAccumulator | null = null;
   #closePromise: Promise<void> | null = null;
@@ -384,6 +428,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     this.#onFault = options.onFault;
     this.#onPermissionModeChanged = options.onPermissionModeChanged;
     this.#onPlanLimit = options.onPlanLimit;
+    this.#onGoalSignal = options.onGoalSignal;
     this.#openMode = options.openMode;
     this.#permissionMode = options.permissionMode;
     this.#queryFactory = options.queryFactory ?? query;
@@ -396,6 +441,10 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
 
   setIdleTurnHandler(handler: ClaudeIdleTurnHandler | null): void {
     this.#idleHandler = handler;
+  }
+
+  setThreadEventHandler(handler: ((event: ClaudeTurnEvent) => void) | null): void {
+    this.#threadEventHandler = handler;
   }
 
   setIdleLive(live: boolean): void {
@@ -435,10 +484,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
         persistSession: true,
         includePartialMessages: true,
         forwardSubagentText: true,
-        env: withNodeRuntimeOnPath({
-          ...this.#environment,
-          CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP,
-        }),
+        env: claudeProcessEnvironment(this.#environment),
         spawnClaudeCodeProcess: (options) => this.#spawn(options),
       },
     });
@@ -860,6 +906,14 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
         }
         const planLimit = parseClaudePlanLimitEvent(message);
         if (planLimit) this.#onPlanLimit(planLimit);
+        // Goal evidence is Session-scoped: it must reach the Adapter whether or
+        // not a requested Turn, an idle continuation, or autonomous work owns
+        // the message.
+        const goalSignal = parseClaudeGoalSignal(message);
+        if (goalSignal) this.#onGoalSignal?.(goalSignal);
+        // `/goal` acknowledgements are control records, not Assistant output.
+        // Feeding them to a Turn accumulator would create a phantom message.
+        if (goalSignal?.type === "command") continue;
         const active = this.#active;
         if (active) {
           const interpreted = active.accumulator.consume(message);
@@ -906,7 +960,16 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
           autonomous.nativeTurnKey = message.uuid;
         }
         const interpreted = autonomous.accumulator.consume(message);
-        autonomous.events.push(...interpreted.events);
+        for (const event of interpreted.events) {
+          if (
+            this.#threadEventHandler &&
+            canDeliverSettlementImmediately(event, autonomous.events)
+          ) {
+            this.#threadEventHandler(event);
+            continue;
+          }
+          autonomous.events.push(event);
+        }
         if (interpreted.terminal) {
           this.#autonomous = null;
           const nativeTurnKey = autonomous.nativeTurnKey ?? `autonomous-${Date.now()}`;
@@ -992,10 +1055,7 @@ export class ClaudeSdkModelInspector implements ClaudeModelInspector {
         tools: [],
         persistSession: false,
         includePartialMessages: false,
-        env: withNodeRuntimeOnPath({
-          ...this.#environment,
-          CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP,
-        }),
+        env: claudeProcessEnvironment(this.#environment),
         spawnClaudeCodeProcess: (options) => this.#spawn(options),
       },
     });
